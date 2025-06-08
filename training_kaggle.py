@@ -1,8 +1,3 @@
-"""
-Training utilities for Bitcoin price prediction using streaming CSV data.
-Optimized for large datasets that don't fit in memory.
-"""
-
 import pandas as pd
 import torch
 from torch.utils.data import IterableDataset, DataLoader
@@ -10,7 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 from collections import deque
 import numpy as np
-
+from tqdm import tqdm
 
 def compute_global_min_max(csv_path, col_name='Close', chunk_size=10000):
     """
@@ -19,7 +14,7 @@ def compute_global_min_max(csv_path, col_name='Close', chunk_size=10000):
     Args:
         csv_path: Path to the CSV file
         col_name: Name of the column to analyze
-        chunk_size: Size of chunks to read at a time
+        chunk_size: Number of rows to read per chunk
         
     Returns:
         tuple: (global_min, global_max)
@@ -27,7 +22,7 @@ def compute_global_min_max(csv_path, col_name='Close', chunk_size=10000):
     global_min = float('inf')
     global_max = float('-inf')
     
-    print(f"Computing global min/max for column '{col_name}'...")
+    print(f"Computing global min/max for column '{col_name}' with chunk_size={chunk_size}...")
     
     chunk_count = 0
     for chunk in pd.read_csv(csv_path, chunksize=chunk_size):
@@ -54,7 +49,7 @@ class BTCIterableDataset(IterableDataset):
     Maintains a rolling buffer to efficiently create sequential samples.
     """
     
-    def __init__(self, csv_path, seq_len, col_name='Close', chunk_size=10000):
+    def __init__(self, csv_path, seq_len, chunk_size, col_name='Close'):
         self.csv_path = csv_path
         self.seq_len = seq_len
         self.col_name = col_name
@@ -101,13 +96,11 @@ def collate_global(batch, global_min, global_max):
     sequences = (sequences - global_min) / (global_max - global_min)
     targets = (targets - global_min) / (global_max - global_min)
     
-    # Reshape sequences to (B, seq_len, 1) for transformer input
+    # Reshape for model: sequences -> (B, seq_len, 1), targets -> (B, 1)
     sequences = sequences.unsqueeze(-1)
-    
-    # Reshape targets to (B, 1)
     targets = targets.unsqueeze(-1)
     
-    # Move to GPU if available
+    # Move to device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     sequences = sequences.to(device)
     targets = targets.to(device)
@@ -115,27 +108,40 @@ def collate_global(batch, global_min, global_max):
     return sequences, targets
 
 
-def get_dataloader(csv_path, seq_len, batch_size, col_name='Close', global_min=3.8, global_max=111975.0, compute_globals=False):
+def get_dataloader(
+    csv_path,
+    seq_len,
+    chunk_size,
+    batch_size,
+    col_name='Close',
+    global_min=3.8,
+    global_max=111975.0,
+    compute_globals=False
+):
     """
-    Create a DataLoader with global normalization parameters.
+    Create a DataLoader for BTC price prediction with streaming and normalization.
     
     Args:
         csv_path: Path to the CSV file
         seq_len: Length of input sequences
+        chunk_size: Number of rows to read per chunk
         batch_size: Batch size for training
         col_name: Name of the price column
-        
+        global_min: Hard-coded global minimum for normalization
+        global_max: Hard-coded global maximum for normalization
+        compute_globals: If True, recompute global min/max from the file
+    
     Returns:
         tuple: (dataloader, global_min, global_max)
     """
-    # Compute global statistics
+    # Compute global stats if requested
     if compute_globals:
-        global_min, global_max = compute_global_min_max(csv_path, col_name)
+        global_min, global_max = compute_global_min_max(csv_path, col_name, chunk_size)
     
-    # Create dataset
-    dataset = BTCIterableDataset(csv_path, seq_len, col_name)
+    # Create dataset with chunk size
+    dataset = BTCIterableDataset(csv_path, seq_len, chunk_size, col_name)
     
-    # Create dataloader with custom collate function
+    # Create dataloader
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -148,13 +154,6 @@ def get_dataloader(csv_path, seq_len, batch_size, col_name='Close', global_min=3
 def train_steps(model, dataloader, num_steps, learning_rate=1e-4, print_every=100):
     """
     Train the model for a fixed number of steps.
-    
-    Args:
-        model: The transformer model to train
-        dataloader: DataLoader providing training data
-        num_steps: Number of training steps to perform
-        learning_rate: Learning rate for optimizer
-        print_every: Print average loss every N steps
     """
     model.train()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
@@ -162,40 +161,36 @@ def train_steps(model, dataloader, num_steps, learning_rate=1e-4, print_every=10
     
     print(f"Starting training for {num_steps} steps...")
     
-    step = 0
     loss_sum = 0.0
     data_iter = iter(dataloader)
     
-    while step < num_steps:
+    for _ in tqdm(range(num_steps)):
         try:
             sequences, targets = next(data_iter)
         except StopIteration:
-            # Restart iterator if we reach the end
             data_iter = iter(dataloader)
             sequences, targets = next(data_iter)
         
-        # Forward pass
         optimizer.zero_grad()
         predictions = model(sequences)
         loss = criterion(predictions, targets)
-        
-        # Backward pass
         loss.backward()
         optimizer.step()
         
         loss_sum += loss.item()
-        step += 1
-        
-        # Print progress
-        if step % print_every == 0:
-            avg_loss = loss_sum / print_every
-            print(f"Step {step}/{num_steps}, Average Loss: {avg_loss:.6f}")
-            loss_sum = 0.0
     
     print("Training completed!")
 
 
-def predict_next(model, csv_path, seq_len, global_min, global_max, col_name='Close'):
+def predict_next(
+    model,
+    csv_path,
+    seq_len,
+    chunk_size,
+    global_min,
+    global_max,
+    col_name='Close'
+):
     """
     Predict the next price using the last seq_len prices from the CSV.
     
@@ -203,6 +198,7 @@ def predict_next(model, csv_path, seq_len, global_min, global_max, col_name='Clo
         model: Trained transformer model
         csv_path: Path to the CSV file
         seq_len: Length of input sequence
+        chunk_size: Number of rows to read per chunk when fetching last prices
         global_min: Global minimum for denormalization
         global_max: Global maximum for denormalization
         col_name: Name of the price column
@@ -212,40 +208,33 @@ def predict_next(model, csv_path, seq_len, global_min, global_max, col_name='Clo
     """
     model.eval()
     
-    # Read the last seq_len prices
-    print(f"Reading last {seq_len} prices from {csv_path}...")
-    
-    # Read in chunks to get the last seq_len values efficiently
+    # Read the full file in chunks to collect last values
     last_prices = []
-    for chunk in pd.read_csv(csv_path, chunksize=10000):
+    for chunk in pd.read_csv(csv_path, chunksize=chunk_size):
         if col_name not in chunk.columns:
             raise ValueError(f"Column '{col_name}' not found in CSV")
         last_prices.extend(chunk[col_name].values.tolist())
     
-    # Take the last seq_len prices
     if len(last_prices) < seq_len:
         raise ValueError(f"Not enough data: need {seq_len}, got {len(last_prices)}")
     
+    # Take last seq_len prices
     sequence = last_prices[-seq_len:]
     
-    # Normalize the sequence
+    # Normalize and reshape for model
     sequence = torch.tensor(sequence, dtype=torch.float32)
     sequence = (sequence - global_min) / (global_max - global_min)
-    
-    # Reshape for model input: (1, seq_len, 1)
-    sequence = sequence.unsqueeze(0).unsqueeze(-1)
-    
-    # Move to device
+    sequence = sequence.unsqueeze(0).unsqueeze(-1)  # -> (1, seq_len, 1)
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     sequence = sequence.to(device)
     
-    # Make prediction
+    # Predict
     with torch.no_grad():
         prediction = model(sequence)
         prediction = prediction.cpu().item()
     
-    # Denormalize prediction
+    # Denormalize
     predicted_price = prediction * (global_max - global_min) + global_min
-    
     print(f"Predicted next price: ${predicted_price:.2f}")
     return predicted_price
