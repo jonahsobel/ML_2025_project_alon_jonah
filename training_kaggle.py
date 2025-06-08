@@ -115,7 +115,7 @@ def collate_global(batch, global_min, global_max):
     return sequences, targets
 
 
-def get_dataloader(csv_path, seq_len, batch_size, col_name='Close'):
+def get_dataloader(csv_path, seq_len, batch_size, col_name='Close', global_min=3.8, global_max=111975.0, compute_globals=False):
     """
     Create a DataLoader with global normalization parameters.
     
@@ -129,7 +129,8 @@ def get_dataloader(csv_path, seq_len, batch_size, col_name='Close'):
         tuple: (dataloader, global_min, global_max)
     """
     # Compute global statistics
-    global_min, global_max = compute_global_min_max(csv_path, col_name)
+    if compute_globals:
+        global_min, global_max = compute_global_min_max(csv_path, col_name)
     
     # Create dataset
     dataset = BTCIterableDataset(csv_path, seq_len, col_name)
